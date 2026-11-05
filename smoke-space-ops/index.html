@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <title>space-ops smoke vault runner</title>
+  <style>
+    body{font:14px/1.4 system-ui,sans-serif;max-width:560px;margin:40px auto;padding:0 16px}
+    label{display:block;margin:12px 0 4px}
+    input{width:100%;padding:8px;box-sizing:border-box}
+    button{margin-top:16px;padding:10px 16px;width:100%}
+    pre{white-space:pre-wrap;background:#111;color:#ddd;padding:12px;border-radius:8px;min-height:200px;font-size:12px}
+  </style>
+  <script type="module">
+    import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1';
+
+    const PROJECT_REF = 'sbwxfmnajedgaudwemim';
+    const SUPABASE_URL = 'https://sbwxfmnajedgaudwemim.supabase.co';
+    const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNid3hmbW5hamVkZ2F1ZHdlbWltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMwNjY2NTQsImV4cCI6MjEwODY0MjY1NH0.QPirqJJfA4ugk-FN3ac8eUoN46O57OGVnh6Jj3LBtOU';
+    const ACCOUNT_A_EMAIL = '997670954-pty2nx+wedding-a@mail.grokbot.com';
+    const ACCOUNT_B_EMAIL = '997670954-pty2nx+wedding-b@mail.grokbot.com';
+
+    function maskEmail(email) {
+      const [local, domain] = String(email).split('@');
+      if (!domain) return '***';
+      return `${local.slice(0, 2)}***@${domain}`;
+    }
+    function maskToken(token) {
+      const value = String(token || '');
+      if (value.length < 12) return '(short)';
+      return `${value.slice(0, 6)}…${value.slice(-4)}(len${value.length})`;
+    }
+    function redactError(error) {
+      if (!error) return '';
+      const message = typeof error === 'string'
+        ? error
+        : [error.message, error.details, error.hint, error.code].filter((part) => typeof part === 'string' && part).join(' | ');
+      return message
+        .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, (email) => maskEmail(email))
+        .replace(/\b[a-f0-9]{32,}\b/gi, (token) => maskToken(token))
+        .slice(0, 240);
+    }
+    function asSpace(data) {
+      let value = data;
+      if (value == null) return null;
+      if (typeof value === 'string') {
+        try { value = JSON.parse(value); } catch { return null; }
+      }
+      if (typeof value !== 'object' || !value.space_code) return null;
+      return { space_code: String(value.space_code), role: value.role == null ? '' : String(value.role) };
+    }
+    function asCount(value) {
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+      if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) return Number(value);
+      return null;
+    }
+    let clientSeq = 0;
+    function memoryStorage() {
+      const store = new Map();
+      return {
+        getItem: (key) => (store.has(key) ? store.get(key) : null),
+        setItem: (key, value) => { store.set(key, value); },
+        removeItem: (key) => { store.delete(key); },
+      };
+    }
+    function clientFor() {
+      clientSeq += 1;
+      return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+          storageKey: `space-ops-${clientSeq}`,
+          storage: memoryStorage(),
+        },
+      });
+    }
+
+    window.__runSmoke = async function runSmoke(passA, passB, log) {
+      const results = [];
+      const record = (name, ok, detail = '') => {
+        results.push({ name, ok, detail });
+        log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ` — ${detail}` : ''}`);
+        return ok;
+      };
+      const finish = (code) => {
+        const failed = results.filter((item) => !item.ok);
+        log('');
+        if (failed.length) {
+          log(`Failed: ${failed.length}/${results.length}`);
+          return code || 1;
+        }
+        log(`Passed: ${results.length}.`);
+        return 0;
+      };
+
+      async function signIn(label, email, password) {
+        const client = clientFor();
+        const { data, error } = await client.auth.signInWithPassword({ email, password });
+        if (error || !data.session?.user?.id) {
+          throw new Error(`${label} sign-in failed: ${redactError(error) || 'no session'}`);
+        }
+        return { label, email, client, userId: data.session.user.id };
+      }
+      async function readSpace(account) {
+        const { data, error } = await account.client.rpc('my_space');
+        if (error) throw new Error(`${account.label} my_space: ${redactError(error)}`);
+        return asSpace(data);
+      }
+      async function callOk(account, fn, params) {
+        const result = params === undefined
+          ? await account.client.rpc(fn)
+          : await account.client.rpc(fn, params);
+        if (result.error) throw new Error(`${account.label} ${fn}: ${redactError(result.error)}`);
+        return result.data;
+      }
+      async function expectFail(name, account, fn, params, patterns) {
+        const result = params === undefined
+          ? await account.client.rpc(fn)
+          : await account.client.rpc(fn, params);
+        if (!result.error) {
+          record(name, false, 'expected an error, RPC succeeded');
+          throw new Error(`state changed after ${name}`);
+        }
+        const blob = `${result.error.message || ''} ${result.error.details || ''} ${result.error.hint || ''} ${result.error.code || ''}`;
+        const hit = patterns.some((pattern) => pattern.test(blob));
+        const safe = redactError(result.error);
+        if (!record(name, hit, hit ? safe : `expected ${patterns.map((pattern) => pattern.source).join('|')}, got ${safe || '(empty)'}`)) {
+          throw new Error(`unexpected error after ${name}`);
+        }
+      }
+      async function inviteAndAccept(owner, joiner) {
+        const invite = await callOk(owner, 'create_space_invite');
+        const token = invite && typeof invite === 'object' ? invite.token : '';
+        if (!token || !/^[a-f0-9]{64}$/i.test(token)) {
+          throw new Error(`${owner.label} create_space_invite returned no token (${maskToken(token)})`);
+        }
+        await callOk(joiner, 'accept_space_invite', { p_token: token });
+        return token;
+      }
+      async function ensureAOwnerBMember(accountA, accountB) {
+        let spaceA = await readSpace(accountA);
+        let spaceB = await readSpace(accountB);
+        if (spaceA && spaceB && spaceA.space_code !== spaceB.space_code) {
+          if (spaceA.role === 'member') {
+            await callOk(accountA, 'leave_space');
+            spaceA = await readSpace(accountA);
+          }
+          if (spaceB && spaceB.role === 'member' && (!spaceA || spaceA.space_code !== spaceB.space_code)) {
+            await callOk(accountB, 'leave_space');
+            spaceB = await readSpace(accountB);
+          }
+          spaceA = await readSpace(accountA);
+          spaceB = await readSpace(accountB);
+          if (spaceA && spaceB && spaceA.space_code !== spaceB.space_code) {
+            throw new Error(`A (${spaceA.space_code}) and B (${spaceB.space_code}) each own a different space.`);
+          }
+        }
+        if (!spaceA && !spaceB) {
+          await callOk(accountA, 'create_space');
+          await inviteAndAccept(accountA, accountB);
+        } else if (spaceA && !spaceB) {
+          if (spaceA.role !== 'owner') throw new Error(`A is a member of ${spaceA.space_code}, whose owner is not B.`);
+          await inviteAndAccept(accountA, accountB);
+        } else if (!spaceA && spaceB) {
+          if (spaceB.role !== 'owner') throw new Error(`B is a member of ${spaceB.space_code}, whose owner is not A.`);
+          await inviteAndAccept(accountB, accountA);
+          await callOk(accountB, 'transfer_space_owner');
+        }
+        spaceA = await readSpace(accountA);
+        spaceB = await readSpace(accountB);
+        if (!spaceA || !spaceB || spaceA.space_code !== spaceB.space_code) {
+          throw new Error('setup did not put A and B in the same space');
+        }
+        if (spaceA.role === 'member' && spaceB.role === 'owner') {
+          await callOk(accountB, 'transfer_space_owner');
+          spaceA = await readSpace(accountA);
+          spaceB = await readSpace(accountB);
+        }
+        if (!spaceA || !spaceB || spaceA.space_code !== spaceB.space_code || spaceA.role !== 'owner' || spaceB.role !== 'member') {
+          throw new Error(`setup roles A=${spaceA?.role || '-'} B=${spaceB?.role || '-'} space=${spaceA?.space_code || '-'}`);
+        }
+        record('setup A owner, B member', true, `space_code=${spaceA.space_code}`);
+        return spaceA.space_code;
+      }
+      async function runAnonDenied() {
+        const anon = clientFor();
+        const denied = [/permission denied/i, /jwt/i, /pgrst301/i, /not_authenticated/i, /\b28000\b/];
+        for (const fn of ['leave_space', 'revoke_space_invite', 'transfer_space_owner']) {
+          const { error } = await anon.rpc(fn);
+          const blob = `${error?.message || ''} ${error?.code || ''} ${error?.details || ''}`;
+          const hit = Boolean(error) && denied.some((pattern) => pattern.test(blob));
+          record(`anon ${fn} denied`, hit, hit ? redactError(error) : `expected permission denied or JWT, got ${redactError(error) || '(no error)'}`);
+        }
+      }
+
+      log(`Target: ${new URL(SUPABASE_URL).host}`);
+      log(`Accounts A=${maskEmail(ACCOUNT_A_EMAIL)}  B=${maskEmail(ACCOUNT_B_EMAIL)}`);
+
+      try {
+        await runAnonDenied();
+        const accountA = await signIn('A', ACCOUNT_A_EMAIL, passA);
+        const accountB = await signIn('B', ACCOUNT_B_EMAIL, passB);
+        const spaceCode = await ensureAOwnerBMember(accountA, accountB);
+
+        await expectFail('leave as owner (other member present) → sole_owner', accountA, 'leave_space', undefined, [/sole_owner/]);
+        const stillA = await readSpace(accountA);
+        const stillB = await readSpace(accountB);
+        if (!record('owner leave rolled back', stillA?.space_code === spaceCode && stillA?.role === 'owner' && stillB?.space_code === spaceCode && stillB?.role === 'member', `A=${stillA?.role || '-'} B=${stillB?.role || '-'}`)) {
+          throw new Error('owner leave changed membership');
+        }
+
+        await expectFail('transfer as member → not_owner', accountB, 'transfer_space_owner', undefined, [/not_owner/]);
+        await expectFail('revoke as member → not_owner', accountB, 'revoke_space_invite', undefined, [/not_owner/]);
+
+        const transferred = await callOk(accountA, 'transfer_space_owner');
+        const afterA = await readSpace(accountA);
+        const afterB = await readSpace(accountB);
+        const ownerRow = await accountB.client.from('wedding_spaces').select('code, owner_id').eq('code', spaceCode).maybeSingle();
+        if (!record('A transfer_space_owner → B owner, A member',
+          transferred?.space_code === spaceCode && transferred?.role === 'member' && afterA?.space_code === spaceCode && afterA?.role === 'member' && afterB?.space_code === spaceCode && afterB?.role === 'owner' && !ownerRow.error && ownerRow.data?.owner_id === accountB.userId,
+          ownerRow.error ? redactError(ownerRow.error) : `A=${afterA?.role || '-'} B=${afterB?.role || '-'} owner_id=${ownerRow.data?.owner_id === accountB.userId ? 'matches B' : 'mismatch'}`)) {
+          throw new Error('transfer did not flip ownership');
+        }
+
+        await expectFail('transfer as member after handoff → not_owner', accountA, 'transfer_space_owner', undefined, [/not_owner/]);
+        await expectFail('revoke as member after handoff → not_owner', accountA, 'revoke_space_invite', undefined, [/not_owner/]);
+
+        const left = await callOk(accountA, 'leave_space');
+        const goneA = await readSpace(accountA);
+        const stayB = await readSpace(accountB);
+        const hidden = await accountA.client.from('wedding_spaces').select('code').eq('code', spaceCode);
+        const visible = await accountB.client.from('wedding_spaces').select('code, owner_id').eq('code', spaceCode).maybeSingle();
+        if (!record('A leave_space → A empty, B still owner',
+          left?.left === true && left?.space_code === spaceCode && goneA == null && stayB?.space_code === spaceCode && stayB?.role === 'owner' && !hidden.error && Array.isArray(hidden.data) && hidden.data.length === 0 && !visible.error && visible.data?.code === spaceCode && visible.data?.owner_id === accountB.userId,
+          `A my_space=${goneA ? goneA.space_code : 'empty'} B=${stayB?.role || '-'}`)) {
+          throw new Error('leave did not match the expected membership');
+        }
+
+        await expectFail('leave with no space → not_member', accountA, 'leave_space', undefined, [/not_member/]);
+        await expectFail('revoke with no space → not_member', accountA, 'revoke_space_invite', undefined, [/not_member/]);
+        await expectFail('transfer with no space → not_owner', accountA, 'transfer_space_owner', undefined, [/not_owner/]);
+        await expectFail('leave as sole owner → sole_owner', accountB, 'leave_space', undefined, [/sole_owner/]);
+        const soleB = await readSpace(accountB);
+        if (!record('sole owner remains after refused leave', soleB?.space_code === spaceCode && soleB?.role === 'owner', `B=${soleB?.role || '-'}`)) {
+          throw new Error('sole-owner leave changed membership');
+        }
+        await expectFail('transfer alone → no_member', accountB, 'transfer_space_owner', undefined, [/no_member/]);
+
+        const issued = await callOk(accountB, 'create_space_invite');
+        const oldToken = issued && typeof issued === 'object' ? issued.token : '';
+        if (!oldToken) throw new Error('owner create_space_invite returned no token');
+        const revoked = await callOk(accountB, 'revoke_space_invite');
+        const revokedCount = asCount(revoked?.revoked_count);
+        if (!record('owner revoke_space_invite', revokedCount !== null && revokedCount >= 1, `revoked_count=${revokedCount === null ? '?' : revokedCount} token=${maskToken(oldToken)}`)) {
+          throw new Error('revoke did not report a count');
+        }
+
+        const acceptOld = await accountA.client.rpc('accept_space_invite', { p_token: oldToken });
+        const acceptBlob = `${acceptOld.error?.message || ''} ${acceptOld.error?.code || ''}`;
+        if (!record('accept revoked token → invite_invalid', Boolean(acceptOld.error) && /invite_invalid/i.test(acceptBlob), acceptOld.error ? redactError(acceptOld.error) : 'RPC succeeded')) {
+          throw new Error('revoked token was accepted');
+        }
+
+        const again = await callOk(accountB, 'revoke_space_invite');
+        const againCount = asCount(again?.revoked_count);
+        if (!record('revoke with nothing active → revoked_count 0', againCount === 0, `revoked_count=${againCount === null ? '?' : againCount}`)) {
+          throw new Error('second revoke was not idempotent');
+        }
+
+        const stillGone = await readSpace(accountA);
+        const stillOwner = await readSpace(accountB);
+        record('end state A empty, B owner', stillGone == null && stillOwner?.space_code === spaceCode && stillOwner?.role === 'owner', `A=${stillGone ? stillGone.space_code : 'empty'} B=${stillOwner?.role || '-'} space_code=${spaceCode}`);
+
+        return finish(0);
+      } catch (error) {
+        log(`Stopped: ${redactError(error)}`);
+        const failed = results.filter((item) => !item.ok);
+        log(results.length ? `Recorded ${failed.length} failing of ${results.length} before stop.` : 'No cases recorded.');
+        return 1;
+      }
+    };
+  </script>
+</head>
+<body>
+  <h1>smoke:space-ops</h1>
+  <p>密码只在本页提交给 Supabase Auth，不写盘、不回显。绿跑后 B 为唯一 owner，A 不在空间。</p>
+  <form id="f">
+    <label for="pass-a">Account A password</label>
+    <input id="pass-a" name="passA" type="password" autocomplete="off" data-testid="vault-pass-a" required />
+    <label for="pass-b">Account B password</label>
+    <input id="pass-b" name="passB" type="password" autocomplete="off" data-testid="vault-pass-b" required />
+    <button type="submit" data-testid="vault-run-submit">Run smoke</button>
+  </form>
+  <pre id="out">(waiting)</pre>
+  <script type="module">
+    const f = document.getElementById('f');
+    const out = document.getElementById('out');
+    const lines = [];
+    const log = (line) => { lines.push(line); out.textContent = lines.join('\n'); };
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      lines.length = 0;
+      out.textContent = 'running…';
+      const passA = document.getElementById('pass-a').value;
+      const passB = document.getElementById('pass-b').value;
+      try {
+        const code = await window.__runSmoke(passA, passB, log);
+        log(`exit=${code}`);
+      } catch (err) {
+        log(`跑通中断：${String(err).slice(0, 200)}`);
+        log('exit=1');
+      }
+    });
+  </script>
+</body>
+</html>
