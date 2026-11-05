@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <title>wedding-zz test signup</title>
+</head>
+<body>
+  <h1>wedding-zz test signup</h1>
+  <form id="f">
+    <label>email <input id="email" name="email" type="email" autocomplete="username" /></label><br/>
+    <label>password <input id="password" name="password" type="password" autocomplete="new-password" /></label><br/>
+    <button type="submit" id="go">Sign up</button>
+  </form>
+  <pre id="out">idle</pre>
+  <script>
+    const URL = 'https://sbwxfmnajedgaudwemim.supabase.co';
+    const KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNid3hmbW5hamVkZ2F1ZHdlbWltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMwNjY2NTQsImV4cCI6MjEwODY0MjY1NH0.QPirqJJfA4ugk-FN3ac8eUoN46O57OGVnh6Jj3LBtOU';
+    const out = document.getElementById('out');
+    document.getElementById('f').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
+      out.textContent = 'signing up…';
+      try {
+        const r = await fetch(URL + '/auth/v1/signup', {
+          method: 'POST',
+          headers: {
+            apikey: KEY,
+            Authorization: 'Bearer ' + KEY,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ email, password })
+        });
+        const text = await r.text();
+        out.textContent = 'status ' + r.status + '\n' + text;
+      } catch (err) {
+        out.textContent = 'error ' + String(err);
+      }
+    });
+  </script>
+</body>
+</html>
