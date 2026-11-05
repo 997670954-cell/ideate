@@ -4,16 +4,183 @@
   <meta charset="utf-8" />
   <title>dual-account smoke vault runner</title>
   <style>
-    body{font:14px/1.4 system-ui,sans-serif;max-width:420px;margin:40px auto;padding:0 16px}
+    body{font:14px/1.4 system-ui,sans-serif;max-width:520px;margin:40px auto;padding:0 16px}
     label{display:block;margin:12px 0 4px}
     input{width:100%;padding:8px;box-sizing:border-box}
     button{margin-top:16px;padding:10px 16px;width:100%}
-    pre{white-space:pre-wrap;background:#111;color:#ddd;padding:12px;border-radius:8px;min-height:120px}
+    pre{white-space:pre-wrap;background:#111;color:#ddd;padding:12px;border-radius:8px;min-height:160px;font-size:12px}
   </style>
+  <script type="module">
+    import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1';
+
+    const SUPABASE_URL = 'https://sbwxfmnajedgaudwemim.supabase.co';
+    const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNid3hmbW5hamVkZ2F1ZHdlbWltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMwNjY2NTQsImV4cCI6MjEwODY0MjY1NH0.QPirqJJfA4ugk-FN3ac8eUoN46O57OGVnh6Jj3LBtOU';
+    const ACCOUNT_A_EMAIL = '997670954-pty2nx+wedding-a@mail.grokbot.com';
+    const ACCOUNT_B_EMAIL = '997670954-pty2nx+wedding-b@mail.grokbot.com';
+    const JOIN_BASE = 'https://example.invalid';
+
+    const emptyPayload = {
+      version: '1', categories: [], notes: [], suggestions: [],
+      tombstones: { notes: [], categories: [], suggestions: [] },
+    };
+
+    function maskEmail(email) {
+      const [local, domain] = email.split('@');
+      if (!domain) return '***';
+      return `${local.slice(0, 2)}***@${domain}`;
+    }
+    function maskToken(token) {
+      if (!token || token.length < 12) return '(short)';
+      return `${token.slice(0, 6)}…${token.slice(-4)}(len${token.length})`;
+    }
+    function redactError(error) {
+      if (!error) return '';
+      const message = typeof error.message === 'string' ? error.message : String(error);
+      return message.slice(0, 200);
+    }
+    function clientFor() {
+      return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+      });
+    }
+    async function signIn(label, email, password) {
+      const client = clientFor();
+      const { data, error } = await client.auth.signInWithPassword({ email, password });
+      if (error || !data.session) throw new Error(`${label} 登录失败：${redactError(error) || '无 session'}`);
+      return client;
+    }
+    async function rpcMessage(client, fn, params) {
+      const { data, error } = await client.rpc(fn, params);
+      return { data, error, message: redactError(error) };
+    }
+
+    window.__runSmoke = async function runSmoke(passA, passB, log) {
+      const results = [];
+      const record = (name, ok, detail = '') => {
+        results.push({ name, ok, detail });
+        log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ` — ${detail}` : ''}`);
+      };
+      const expectError = (name, message, patterns) => {
+        const hit = patterns.some((re) => re.test(message || ''));
+        record(name, hit, hit ? message : `期望 ${patterns.map((r) => r.source).join('|')}，实际：${message || '(empty)'}`);
+      };
+
+      log(`目标真库：${SUPABASE_URL}`);
+      log(`账号 A=${maskEmail(ACCOUNT_A_EMAIL)}  B=${maskEmail(ACCOUNT_B_EMAIL)}`);
+
+      let inviteToken = '';
+      let spaceCode = '';
+
+      const clientA = await signIn('A', ACCOUNT_A_EMAIL, passA);
+      let { data: myA, error: myAErr } = await clientA.rpc('my_space');
+      if (myAErr) throw new Error(`A my_space：${redactError(myAErr)}`);
+      if (!myA?.space_code) {
+        const created = await clientA.rpc('create_space');
+        if (created.error) throw new Error(`A create_space：${redactError(created.error)}`);
+        myA = created.data;
+      }
+      spaceCode = myA?.space_code || '';
+      record('A 拥有/创建空间', Boolean(spaceCode), spaceCode ? `space_code=${spaceCode} role=${myA?.role || '?'}` : '无 space_code');
+
+      const invite = await clientA.rpc('create_space_invite');
+      if (invite.error) throw new Error(`A create_space_invite：${redactError(invite.error)}`);
+      inviteToken = invite.data?.token || '';
+      const joinUrl = inviteToken ? `${JOIN_BASE.split('#')[0]}#join=${encodeURIComponent(inviteToken)}` : '';
+      record(
+        'A 生成邀请',
+        Boolean(inviteToken && inviteToken.length >= 32),
+        `token=${maskToken(inviteToken)} expires_at=${invite.data?.expires_at || '?'} join=${joinUrl ? joinUrl.replace(inviteToken, maskToken(inviteToken)) : '(none)'}`,
+      );
+
+      const clientB = await signIn('B', ACCOUNT_B_EMAIL, passB);
+      const beforeB = await clientB.rpc('my_space');
+      if (beforeB.error) throw new Error(`B my_space：${redactError(beforeB.error)}`);
+      if (beforeB.data?.space_code && beforeB.data.space_code !== spaceCode) {
+        record('B 加入前检查', false, `B 已在其他空间 ${beforeB.data.space_code}；请换干净测试号或先清理成员`);
+      } else {
+        record('B 加入前检查', true, beforeB.data?.space_code ? `已在本空间 ${beforeB.data.space_code}` : '尚未入空间');
+        if (!beforeB.data?.space_code) {
+          const accepted = await clientB.rpc('accept_space_invite', { p_token: inviteToken });
+          if (accepted.error) record('B accept_space_invite', false, redactError(accepted.error));
+          else {
+            const code = accepted.data?.space_code || '';
+            record('B accept_space_invite', code === spaceCode, `space_code=${code} role=${accepted.data?.role || '?'}`);
+          }
+        } else {
+          record('B accept_space_invite', true, '已在本空间，跳过重复加入');
+        }
+      }
+
+      const mergeA = await clientA.rpc('merge_space', {
+        p_code: spaceCode, p_payload: emptyPayload, p_base_updated_at: null,
+      });
+      record('A merge_space 空载荷', !mergeA.error, mergeA.error ? redactError(mergeA.error) : `updated_at=${mergeA.data?.updated_at || '?'}`);
+
+      const rowB = await clientB.from('wedding_spaces').select('code,updated_at').eq('code', spaceCode).limit(1);
+      record(
+        'B 可读同一空间行',
+        !rowB.error && Array.isArray(rowB.data) && rowB.data[0]?.code === spaceCode,
+        rowB.error ? redactError(rowB.error) : `code=${rowB.data?.[0]?.code || '?'} updated_at=${rowB.data?.[0]?.updated_at || '?'}`,
+      );
+
+      await clientA.auth.signOut().catch(() => {});
+      await clientB.auth.signOut().catch(() => {});
+
+      {
+        const anon = clientFor();
+        const r = await rpcMessage(anon, 'create_space_invite');
+        expectError('匿名 create_space_invite 被拒', r.message, [/not_authenticated|permission denied|JWT|401|28000/i]);
+      }
+      {
+        const anon = clientFor();
+        const r = await rpcMessage(anon, 'accept_space_invite', { p_token: 'a'.repeat(64) });
+        expectError('匿名 accept_space_invite 被拒', r.message, [/not_authenticated|permission denied|JWT|401|28000/i]);
+      }
+      {
+        const a = await signIn('A', ACCOUNT_A_EMAIL, passA);
+        const r = await rpcMessage(a, 'accept_space_invite', { p_token: '0'.repeat(64) });
+        expectError('无效邀请码 invite_invalid', r.message, [/invite_invalid/i]);
+        await a.auth.signOut().catch(() => {});
+      }
+      {
+        const a = await signIn('A', ACCOUNT_A_EMAIL, passA);
+        const inv = await a.rpc('create_space_invite');
+        if (inv.error) record('自邀前置：A 再生成邀请', false, redactError(inv.error));
+        else {
+          const self = await rpcMessage(a, 'accept_space_invite', { p_token: inv.data.token });
+          expectError('邀请自用 invite_self', self.message, [/invite_self/i]);
+        }
+        await a.auth.signOut().catch(() => {});
+      }
+      {
+        const a = await signIn('A', ACCOUNT_A_EMAIL, passA);
+        const b = await signIn('B', ACCOUNT_B_EMAIL, passB);
+        const myB = await b.rpc('my_space');
+        const inv = await a.rpc('create_space_invite');
+        if (inv.error) record('已在空间前置：A 生成邀请', false, redactError(inv.error));
+        else if (!myB.data?.space_code) record('已在空间/重复加入', true, 'B 尚无空间，跳过 already_in_space');
+        else {
+          const again = await rpcMessage(b, 'accept_space_invite', { p_token: inv.data.token });
+          expectError('已在空间 already_in_space', again.message, [/already_in_space/i]);
+        }
+        await a.auth.signOut().catch(() => {});
+        await b.auth.signOut().catch(() => {});
+      }
+
+      const failed = results.filter((item) => !item.ok);
+      log('');
+      if (failed.length) {
+        log(`未通过：${failed.length}/${results.length}`);
+        return 1;
+      }
+      log(`全部通过：${results.length} 项。`);
+      return 0;
+    };
+  </script>
 </head>
 <body>
   <h1>smoke:dual-account</h1>
-  <p>密码仅 POST 到本机 runner 隧道，不写盘、不回显。</p>
+  <p>密码只在本页提交给 Supabase Auth，不写盘、不回显。</p>
   <form id="f">
     <label for="pass-a">Account A password</label>
     <input id="pass-a" name="passA" type="password" autocomplete="off" data-testid="vault-pass-a" required />
@@ -22,27 +189,23 @@
     <button type="submit" data-testid="vault-run-submit">Run smoke</button>
   </form>
   <pre id="out">(waiting)</pre>
-  <script>
-    const params = new URLSearchParams(location.search);
-    const runner = (params.get('runner') || '').replace(/\/+$/, '');
+  <script type="module">
     const f = document.getElementById('f');
     const out = document.getElementById('out');
-    if (!runner) out.textContent = 'FAIL  missing ?runner=https://…trycloudflare.com';
+    const lines = [];
+    const log = (line) => { lines.push(line); out.textContent = lines.join('\n'); };
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
-      if (!runner) return;
+      lines.length = 0;
       out.textContent = 'running…';
-      const fd = new FormData(f);
-      const body = new URLSearchParams({ passA: fd.get('passA'), passB: fd.get('passB') });
+      const passA = document.getElementById('pass-a').value;
+      const passB = document.getElementById('pass-b').value;
       try {
-        const res = await fetch(runner + '/run', {
-          method: 'POST',
-          headers: { 'content-type': 'application/x-www-form-urlencoded' },
-          body,
-        });
-        out.textContent = await res.text();
+        const code = await window.__runSmoke(passA, passB, log);
+        log(`exit=${code}`);
       } catch (err) {
-        out.textContent = 'FAIL  runner request — ' + String(err).slice(0, 200);
+        log(`跑通中断：${String(err).slice(0, 200)}`);
+        log('exit=1');
       }
     });
   </script>
