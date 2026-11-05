@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <title>dual-account smoke vault runner</title>
+  <style>
+    body{font:14px/1.4 system-ui,sans-serif;max-width:420px;margin:40px auto;padding:0 16px}
+    label{display:block;margin:12px 0 4px}
+    input{width:100%;padding:8px;box-sizing:border-box}
+    button{margin-top:16px;padding:10px 16px;width:100%}
+    pre{white-space:pre-wrap;background:#111;color:#ddd;padding:12px;border-radius:8px;min-height:120px}
+  </style>
+</head>
+<body>
+  <h1>smoke:dual-account</h1>
+  <p>密码仅 POST 到本机 runner 隧道，不写盘、不回显。</p>
+  <form id="f">
+    <label for="pass-a">Account A password</label>
+    <input id="pass-a" name="passA" type="password" autocomplete="off" data-testid="vault-pass-a" required />
+    <label for="pass-b">Account B password</label>
+    <input id="pass-b" name="passB" type="password" autocomplete="off" data-testid="vault-pass-b" required />
+    <button type="submit" data-testid="vault-run-submit">Run smoke</button>
+  </form>
+  <pre id="out">(waiting)</pre>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const runner = (params.get('runner') || '').replace(/\/+$/, '');
+    const f = document.getElementById('f');
+    const out = document.getElementById('out');
+    if (!runner) out.textContent = 'FAIL  missing ?runner=https://…trycloudflare.com';
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!runner) return;
+      out.textContent = 'running…';
+      const fd = new FormData(f);
+      const body = new URLSearchParams({ passA: fd.get('passA'), passB: fd.get('passB') });
+      try {
+        const res = await fetch(runner + '/run', {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          body,
+        });
+        out.textContent = await res.text();
+      } catch (err) {
+        out.textContent = 'FAIL  runner request — ' + String(err).slice(0, 200);
+      }
+    });
+  </script>
+</body>
+</html>
